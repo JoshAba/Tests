@@ -1,0 +1,389 @@
+name: GitOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - develop
+      - sit
+      - sit-lite
+      - prod
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Version to deploy in higher env (leave empty for auto-generation in dev)'
+        required: false
+        type: string
+
+env:
+  DEPLOY_SERVER: 'Udeploy-HPHC'
+  REPOSITORY_URL: ${{ github.repository }}
+  SNYK_ORG: 'portal-eF4tGofcH5sjyF4rsX5aty'
+  GRADLE_VERSION: '8.14.2'
+  JAVA_VERSION: '17'
+
+jobs:
+  setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    outputs:
+      app_id: ${{ steps.gradle_props.outputs.app_id }}
+      app_version: ${{ steps.gradle_props.outputs.app_version }}
+      env_var: ${{ steps.env_setup.outputs.env_var }}
+      version_tag: ${{ steps.version.outputs.version_tag }}
+      ocp_api_url: ${{ steps.ocp_api.outputs.ocp_api_url }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Extract Gradle Properties
+        id: gradle_props
+        run: |
+          gradle properties --no-daemon --quiet | grep -E 'version|name' > gradle_props.txt
+          APP_ID=$(grep '^name:' gradle_props.txt | cut -d':' -f2 | xargs)
+          APP_VERSION=$(grep '^version:' gradle_props.txt | cut -d':' -f2 | xargs)
+          echo "app_id=${APP_ID}" >> $GITHUB_OUTPUT
+          echo "app_version=${APP_VERSION}" >> $GITHUB_OUTPUT
+          echo "App Name: ${APP_ID}"
+          echo "App Version: ${APP_VERSION}"
+
+      - name: Determine Environment
+        id: env_setup
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          case $BRANCH_NAME in
+            develop)
+              ENV_VAR="dev"
+              ;;
+            sit-lite)
+              ENV_VAR="sit-lite"
+              ;;
+            sit)
+              ENV_VAR="sit"
+              ;;
+            prod|main|master)
+              ENV_VAR="prod"
+              ;;
+            *)
+              ENV_VAR="dev"
+              ;;
+          esac
+          echo "env_var=${ENV_VAR}" >> $GITHUB_OUTPUT
+          echo "Environment: ${ENV_VAR}"
+
+      - name: Set Version Tag
+        id: version
+        run: |
+          if [ "${{ steps.env_setup.outputs.env_var }}" = "dev" ]; then
+            VERSION_TAG="${{ github.run_number }}_$(date +%Y%m%d_%H%M%S)"
+          else
+            VERSION_TAG="${{ github.event.inputs.version_tag || github.run_number }}"
+          fi
+          echo "version_tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
+          echo "Version Tag: ${VERSION_TAG}"
+
+      - name: Set OCP API URL
+        id: ocp_api
+        run: |
+          case ${{ steps.env_setup.outputs.env_var }} in
+            dev)
+              OCP_API_URL="https://api.arodev.cloud.p32health.org:6443"
+              ;;
+            sit-lite|sit)
+              OCP_API_URL="https://api.arosit.cloud.p32health.org:6443"
+              ;;
+            prod)
+              OCP_API_URL="https://api.aroprod.cloud.p32health.org:6443"
+              ;;
+            prod2)
+              OCP_API_URL="https://api.aroprod2.cloud.p32health.org:6443"
+              ;;
+            *)
+              OCP_API_URL="https://api.arodev.cloud.p32health.org:6443"
+              ;;
+          esac
+          echo "ocp_api_url=${OCP_API_URL}" >> $GITHUB_OUTPUT
+          echo "OCP API URL: ${OCP_API_URL}"
+
+  security-scan:
+    name: Security Scanning with Snyk
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.env_var == 'dev'
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Prepare Gradle Wrapper
+        run: |
+          find . -type f -name "gradlew" -exec chmod 755 {} \;
+
+      - name: Run Snyk SAST Scan
+        continue-on-error: true
+        uses: snyk/actions/gradle@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: code test
+          args: --org=${{ env.SNYK_ORG }} --project-name=${{ needs.setup.outputs.app_id }}
+
+      - name: Run Snyk SCA Scan
+        continue-on-error: true
+        uses: snyk/actions/gradle@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --all-sub-projects --org=${{ env.SNYK_ORG }} --project-name=${{ needs.setup.outputs.app_id }}
+
+      - name: Upload Snyk Results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [setup, security-scan]
+    if: |
+      always() && 
+      needs.setup.result == 'success' && 
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Build with Gradle
+        run: |
+          gradle -i build -x test
+          ls -la build/libs/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: build/libs/*.jar
+          retention-days: 30
+
+  push-to-ucd:
+    name: Push Artifact to UrbanCode Deploy
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    if: needs.setup.outputs.env_var == 'dev'
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar
+          path: build/libs/
+
+      - name: Push to UrbanCode Deploy
+        run: |
+          echo "Pushing artifacts to UrbanCode Deploy"
+          # Custom script or API call to push to UCD
+          # This would need to be implemented based on your UCD API
+          echo "Component: ${{ needs.setup.outputs.app_id }}"
+          echo "Version: ${{ needs.setup.outputs.version_tag }}"
+          echo "Artifacts: $(ls build/libs/)"
+
+  checkout-helm-values:
+    name: Checkout Helm Values Repository
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Checkout Helm Values Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'ase/helm_values'
+          ref: 'develop'
+          path: 'helm-values'
+          token: ${{ secrets.HELM_VALUES_REPO_TOKEN }}
+
+      - name: Upload Helm Values
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-values
+          path: helm-values/
+          retention-days: 1
+
+  build-and-deploy-dev:
+    name: Build Image and Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [setup, build, checkout-helm-values]
+    if: needs.setup.outputs.env_var == 'dev'
+    environment:
+      name: dev
+      url: https://api.arodev.cloud.p32health.org:6443
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar
+          path: build/libs/
+
+      - name: Download Helm Values
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-values
+          path: helm-values/
+
+      - name: Setup OpenShift CLI
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ needs.setup.outputs.ocp_api_url }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN_DEV }}
+          insecure_skip_tls_verify: false
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Deploy to OpenShift Dev
+        env:
+          APP_ID: ${{ needs.setup.outputs.app_id }}
+          APP_VERSION: ${{ needs.setup.outputs.app_version }}
+          VERSION_TAG: ${{ needs.setup.outputs.version_tag }}
+          ENV_VAR: ${{ needs.setup.outputs.env_var }}
+        run: |
+          oc project point32-apps-${ENV_VAR}
+          
+          # Add Helm repository
+          helm repo add p32helm https://nexusprd:9091/nexus/repository/p32helm/ --insecure-skip-tls-verify
+          helm repo update p32helm
+          
+          # Generate BuildConfig for Dev
+          helm template ${APP_ID} p32helm/master-chart \
+            --version '3.x' \
+            --insecure-skip-tls-verify \
+            --dry-run=server \
+            --set skipTemplate=true \
+            --set image.tag=${VERSION_TAG} \
+            -s templates/bc.yaml \
+            -f helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml > bc.yaml
+          
+          cat bc.yaml
+          oc apply -f bc.yaml
+          
+          # Start build with artifact
+          oc start-build bc/${APP_ID} \
+            --from-file=./build/libs/${APP_ID}-${APP_VERSION}.jar \
+            --follow
+          
+          # Deploy using Helm
+          cat helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml
+          helm upgrade ${APP_ID} p32helm/master-chart \
+            --version '3.x' \
+            --insecure-skip-tls-verify \
+            --take-ownership \
+            --set image.tag=${VERSION_TAG} \
+            -f helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml \
+            --install
+
+  deploy-higher-env:
+    name: Deploy to Higher Environments
+    runs-on: ubuntu-latest
+    needs: [setup, checkout-helm-values]
+    if: |
+      needs.setup.outputs.env_var == 'sit' || 
+      needs.setup.outputs.env_var == 'sit-lite' || 
+      needs.setup.outputs.env_var == 'prod'
+    environment:
+      name: ${{ needs.setup.outputs.env_var }}
+      url: ${{ needs.setup.outputs.ocp_api_url }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Helm Values
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-values
+          path: helm-values/
+
+      - name: Setup OpenShift CLI
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ needs.setup.outputs.ocp_api_url }}
+          openshift_token: ${{ needs.setup.outputs.env_var == 'sit' && secrets.OPENSHIFT_TOKEN_SIT || needs.setup.outputs.env_var == 'sit-lite' && secrets.OPENSHIFT_TOKEN_SIT_LITE || secrets.OPENSHIFT_TOKEN_PROD }}
+          insecure_skip_tls_verify: true
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Deploy to OpenShift
+        env:
+          APP_ID: ${{ needs.setup.outputs.app_id }}
+          VERSION_TAG: ${{ needs.setup.outputs.version_tag }}
+          ENV_VAR: ${{ needs.setup.outputs.env_var }}
+        run: |
+          oc project point32-apps-${ENV_VAR}
+          
+          # Add Helm repository
+          helm repo add p32helm https://nexusprd:9091/nexus/repository/p32helm/ --insecure-skip-tls-verify
+          helm repo update p32helm
+          
+          # Display values file
+          cat helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml
+          
+          # Deploy using Helm
+          helm upgrade ${APP_ID} p32helm/master-chart \
+            --version '2.x' \
+            --insecure-skip-tls-verify \
+            --take-ownership \
+            --set image.tag=${VERSION_TAG} \
+            -f helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml \
+            --install
+
+  cleanup:
+    name: Cleanup Artifacts
+    runs-on: ubuntu-latest
+    needs: [build-and-deploy-dev, deploy-higher-env]
+    if: always()
+    steps:
+      - name: Delete Temporary Artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            application-jar
+            helm-values
+          failOnError: false
