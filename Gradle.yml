@@ -1,0 +1,282 @@
+pipeline:
+  agent:
+    label: web-jenkins-agent-ubi-gradle-jdk21
+  
+  triggers:
+    - githubPush
+  
+  parameters:
+    - name: BranchName
+      type: string
+      defaultValue: develop
+      trim: true
+      description: Branch to Build
+    - name: VERSION_TAG
+      type: string
+      defaultValue: ""
+      trim: true
+      description: Version to deploy in higher env
+  
+  environment:
+    # UCD Vars
+    DEPLOY_SERVER: Udeploy-HPHC
+    
+    # SCM Vars
+    REPOSITORY_URL: ${repoUrl}
+    
+    # Snyk vars
+    SNYK_HOME:
+      tool: Snyk
+    SNYK_ORG: portal-eF4tGofcH5sjyF4rsX5aty
+    AUTH_TOKEN:
+      credentials: Portal-snyk-devops
+    VERSION: ${BUILD_NUMBER}_${BUILD_TIMESTAMP}
+  
+  tools:
+    gradle: Gradle8.14.2
+    jdk: jdk-17.0.15
+  
+  stages:
+    - name: Checkout from Bitbucket
+      steps:
+        - checkout:
+            class: GitSCM
+            branches:
+              - name: $params.BranchName
+            extensions: []
+            gitTool: git
+            userRemoteConfigs:
+              - credentialsId: web-jenkins-service-p32
+                url: ${repoUrl}
+    
+    - name: Checkout External Helm Values from Bitbucket
+      steps:
+        - checkout:
+            class: GitSCM
+            branches:
+              - name: '*/develop'
+            extensions:
+              - class: RelativeTargetDirectory
+                relativeTargetDir: /tmp/external-helm-values
+            gitTool: git
+            userRemoteConfigs:
+              - credentialsId: P32-ase-jenkins-service
+                url: https://bitbucket-prd.hphc.org/scm/ase/helm_values.git
+    
+    - name: Set up Environment Variables
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - script: |
+            # Grab APP ID from gradle configuration
+            gradleProps=$(gradle properties --no-daemon --quiet | grep -E 'version|name')
+            
+            # Parse gradle properties
+            APP_ID=$(echo "$gradleProps" | grep '^name:' | cut -d':' -f2 | xargs)
+            APP_VERSION=$(echo "$gradleProps" | grep '^version:' | cut -d':' -f2 | xargs)
+            
+            echo "App Name: ${APP_ID}"
+            echo "App Version: ${APP_VERSION}"
+            
+            # Get ENV name from folder path
+            ENV_VAR=$(echo $JOB_NAME | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+            
+            if [ -z "$APP_ID" ]; then
+              exit 1
+            fi
+            
+            if [ "$ENV_VAR" = "dev" ]; then
+              VERSION="${BUILD_NUMBER}_${BUILD_TIMESTAMP}"
+              VERSION_TAG="$VERSION"
+            fi
+            
+            echo "version: ${VERSION}"
+            echo "version_tag: ${VERSION_TAG}"
+    
+    - name: Set up OCP API Environment Variable
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - script: |
+            case $ENV_VAR in
+              dev)
+                OCP_API_URL="https://api.arodev.cloud.p32health.org:6443"
+                ;;
+              sit-lite|sit)
+                OCP_API_URL="https://api.arosit.cloud.p32health.org:6443"
+                ;;
+              prod)
+                OCP_API_URL="https://api.aroprod.cloud.p32health.org:6443"
+                ;;
+              prod2)
+                OCP_API_URL="https://api.aroprod2.cloud.p32health.org:6443"
+                ;;
+              *)
+                OCP_API_URL="https://api.arodev.cloud.p32health.org:6443"
+                ;;
+            esac
+    
+    - name: Snyk Initialization
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - echo: Running Snyk Initialization
+        - shell: |
+            # Preparing gradle files for Snyk SCA
+            find . -type f -name "gradlew" -exec chmod 755 {} \;
+        - shell: $SNYK_HOME/snyk-linux auth $AUTH_TOKEN
+    
+    - name: Snyk Scan - SAST
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - echo: Running Snyk SAST Scan
+        - catchError:
+            buildResult: SUCCESS
+            stageResult: FAILURE
+            script: |
+              # Perform Snyk Code Scanning
+              codeSafe=true
+              
+              if ! $SNYK_HOME/snyk-linux code test --org=$SNYK_ORG --project-name=${snykProjectName}; then
+                codeSafe=false
+              fi
+              
+              if [ "$codeSafe" = false ]; then
+                echo "SAST Status: $codeSafe"
+                snykStatus=false
+                exit 1
+              fi
+    
+    - name: Snyk Scan - SCA
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - echo: Running Snyk SCA Scan
+        - catchError:
+            buildResult: SUCCESS
+            stageResult: FAILURE
+            script: |
+              # Perform Snyk SCA - OpenSource Scanning
+              scaSafe=true
+              
+              if ! $SNYK_HOME/snyk-linux test --all-sub-projects --org=$SNYK_ORG --project-name=${snykProjectName}; then
+                scaSafe=false
+              fi
+              
+              if [ "$scaSafe" = false ]; then
+                echo "SCA Status: $scaSafe"
+                snykStatus=false
+                exit 1
+              fi
+    
+    # Snyk Gating enablement (commented out)
+    # - name: Snyk Scans Status Check
+    #   when:
+    #     allOf:
+    #       - expression: return ENV_VAR == 'dev'
+    #       - expression: return !snykStatus
+    #   steps:
+    #     - echo: Failing the Pipeline
+    #     - error: Snyk scans have failed
+    
+    - name: Gradle Build
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - shell: |
+            cd ${WORKSPACE}
+            ls -la
+            gradle -i build -x test
+            ls -la
+            cd ${WORKSPACE}/build/libs
+            ls -al
+    
+    - name: Push Artifact to UrbanCode Deploy
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - UCDeployPublisher:
+            siteName: ${DEPLOY_SERVER}
+            component:
+              class: com.urbancode.jenkins.plugins.ucdeploy.VersionHelper$VersionBlock
+              componentName: ${APP_ID}
+              delivery:
+                class: com.urbancode.jenkins.plugins.ucdeploy.DeliveryHelper$Push
+                pushVersion: ${VERSION}
+                baseDir: ${WORKSPACE}/build/libs
+                fileIncludePatterns: '*.jar'
+                fileExcludePatterns: ''
+                pushProperties: |
+                  jenkins.server=Local
+                  jenkins.reviewed=false
+                pushDescription: Pushed from Jenkins Pipeline build ${BUILD_ID}
+                pushIncremental: false
+    
+    - name: Image Build and Deploy to Dev
+      when:
+        environment:
+          name: ENV_VAR
+          value: dev
+      steps:
+        - withOcCli:
+            credentialsId: point32-apps-aro-${ENV_VAR}-sa
+            insecure: false
+            installation: OCP_CLI
+            url: https://api.arodev.cloud.p32health.org:6443
+            commands:
+              - oc project point32-apps-${ENV_VAR}
+              - pwd
+              - ls -l
+              - echo 'VERSION_TAG: ${VERSION_TAG}'
+              - helm repo add p32helm https://nexusprd:9091/nexus/repository/p32helm/ --insecure-skip-tls-verify
+              - helm repo update p32helm
+              # Only for Dev Start
+              - helm template ${APP_ID} p32helm/master-chart --version '3.x' --insecure-skip-tls-verify --dry-run=server --set skipTemplate=true --set image.tag=${VERSION_TAG} -s templates/bc.yaml -f /tmp/external-helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml > bc.yaml
+              - cat bc.yaml
+              - oc apply -f bc.yaml
+              - oc start-build bc/${APP_ID} --from-file=./build/libs/'${APP_ID}-${APP_VERSION}.jar' --follow
+              # Only for Dev End
+              - cat /tmp/external-helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml
+              - helm upgrade ${APP_ID} p32helm/master-chart --version '3.x' --insecure-skip-tls-verify --take-ownership --set image.tag=${VERSION_TAG} -f /tmp/external-helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml --install
+    
+    - name: Deploy Image
+      when:
+        anyOf:
+          - expression: return ENV_VAR == 'sit'
+          - expression: return ENV_VAR == 'sit-lite'
+          - expression: return ENV_VAR == 'prod'
+      steps:
+        - withOcCli:
+            credentialsId: point32-apps-${ENV_VAR}-sa
+            insecure: true
+            installation: OCP_CLI
+            url: ${OCP_API_URL}
+            commands:
+              - oc project point32-apps-${ENV_VAR}
+              - helm repo add p32helm https://nexusprd:9091/nexus/repository/p32helm/ --insecure-skip-tls-verify
+              - helm repo update p32helm
+              - cat /tmp/external-helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml
+              - helm upgrade ${APP_ID} p32helm/master-chart --version '2.x' --insecure-skip-tls-verify --take-ownership --set image.tag=${VERSION_TAG} -f /tmp/external-helm-values/point32-apps/${APP_ID}/${ENV_VAR}-values.yaml --install
+    
+    - name: Clean Workspace
+      steps:
+        - cleanWs
+  
+  post:
+    always:
+      - shell: $SNYK_HOME/snyk-linux config clear
