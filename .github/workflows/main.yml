@@ -345,11 +345,17 @@ jobs:
           name: helm-values
           path: helm-values/
 
+      - name: Get OpenShift Token Secret Name
+        id: token_secret
+        run: |
+          ENV_UPPER=$(echo "${{ needs.setup.outputs.env_var }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          echo "secret_name=OPENSHIFT_TOKEN_${ENV_UPPER}" >> $GITHUB_OUTPUT
+
       - name: Setup OpenShift CLI
         uses: redhat-actions/oc-login@v1
         with:
           openshift_server_url: ${{ needs.setup.outputs.ocp_api_url }}
-          openshift_token: ${{ secrets[format('OPENSHIFT_TOKEN_{0}', upper(needs.setup.outputs.env_var))] }}
+          openshift_token: ${{ secrets[steps.token_secret.outputs.secret_name] }}
           insecure_skip_tls_verify: true
 
       - name: Setup Helm
